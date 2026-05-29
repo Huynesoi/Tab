@@ -1,63 +1,83 @@
-// index.js
 const express = require('express');
 const app = express();
 app.use(express.json());
 
-// Lưu trữ dữ liệu các tab: { ip_address: { sessionId: { lastPing, ram, fps } } }
-const activeClients = {};
-
-// Hằng số điện năng
-const BASE_POWER_KW = 0.04; // Điện nền của PC/Laptop (40W)
-const ELECTRICITY_RATE = 2500; // Giá điện VNĐ/kWh
+// Lưu trữ trạng thái theo IP mạng của bạn
+const serverState = {};
+const BASE_POWER_KW = 0.04; 
+const ELECTRICITY_RATE = 2500;
 
 app.post('/api/sync-power', (req, res) => {
-    // Lấy IP của người dùng (Render dùng x-forwarded-for)
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-    const { sessionId, ram, fps } = req.body;
+    
+    // Khởi tạo State cho IP mới nếu chưa có
+    if (!serverState[ip]) {
+        serverState[ip] = { 
+            clients: {}, 
+            globalFps: 10, 
+            globalAntiLag: false, 
+            resetTimestamp: Date.now() 
+        };
+    }
+    const state = serverState[ip];
+    const { sessionId, accountName, ram, fps, action, actionValue } = req.body;
 
-    if (!activeClients[ip]) {
-        activeClients[ip] = {};
+    // XỬ LÝ LỆNH ĐIỀU KHIỂN TỪ CLIENT (NẾU CÓ)
+    if (action === "reset_cost") {
+        state.resetTimestamp = Date.now();
+    } else if (action === "set_fps") {
+        state.globalFps = Number(actionValue);
+    } else if (action === "toggle_antilag") {
+        state.globalAntiLag = Boolean(actionValue);
     }
 
-    // Cập nhật thời gian ping cuối cùng của Tab này
-    activeClients[ip][sessionId] = { 
-        lastPing: Date.now(), 
-        ram: Number(ram), 
-        fps: Number(fps) 
-    };
-
-    // Dọn dẹp các Tab đã tắt (không ping trong 10 giây)
-    let totalActiveTabs = 0;
+    // DỌN DẸP TAB AFK (12s không ping)
     const now = Date.now();
-    for (const id in activeClients[ip]) {
-        if (now - activeClients[ip][id].lastPing > 10000) {
-            delete activeClients[ip][id];
-        } else {
-            totalActiveTabs++;
+    for (const id in state.clients) {
+        if (now - state.clients[id].lastPing > 12000) {
+            delete state.clients[id];
         }
     }
 
-    // TÍNH TOÁN ĐIỆN NĂNG CHO RIÊNG TAB NÀY
-    // 1. Chia đều tiền điện nền cho số lượng tab đang mở
-    const sharedBasePowerKW = BASE_POWER_KW / totalActiveTabs;
-    
-    // 2. Tính lượng điện phát sinh do phần cứng phải xử lý đồ họa/RAM cho tab này
-    const tabSpecificLoadKW = ((ram / 1000) * 0.012) + ((fps / 60) * 0.035);
-    
-    // 3. Tổng điện của Tab này
-    const totalKW_PerHour = sharedBasePowerKW + tabSpecificLoadKW;
-    const cost_PerHour = totalKW_PerHour * ELECTRICITY_RATE;
+    // TÍNH TOÁN CHO TAB GỬI REQUEST
+    if (sessionId) {
+        const totalActiveTabs = Object.keys(state.clients).length + (state.clients[sessionId] ? 0 : 1);
+        const sharedBasePower = BASE_POWER_KW / totalActiveTabs;
+        const tabSpecificLoad = ((Number(ram) / 1000) * 0.012) + ((Number(fps) / 60) * 0.035);
+        const tabTotalKWPerHour = sharedBasePower + tabSpecificLoad;
+        
+        state.clients[sessionId] = {
+            accountName: accountName || "Unknown",
+            lastPing: now,
+            cost24h: tabTotalKWPerHour * 24 * ELECTRICITY_RATE
+        };
+    }
 
+    // TỔNG HỢP LOGS VÀ TỔNG TIỀN
+    let totalNetworkCost24h = 0;
+    const logs = [];
+    let activeTabCount = 0;
+    for (const id in state.clients) {
+        activeTabCount++;
+        totalNetworkCost24h += state.clients[id].cost24h;
+        logs.push({
+            name: state.clients[id].accountName,
+            cost: Math.floor(state.clients[id].cost24h)
+        });
+    }
+
+    // TRẢ VỀ DỮ LIỆU ĐỒNG BỘ CHO TẤT CẢ CÁC TAB
     res.json({
         success: true,
-        activeTabs: totalActiveTabs,
-        tabKWPerHour: totalKW_PerHour,
-        tabCostPerHour: cost_PerHour,
-        tabCostPer24h: cost_PerHour * 24
+        activeTabs: activeTabCount,
+        tabCostPer24h: state.clients[sessionId]?.cost24h || 0,
+        totalNetworkCost24h: totalNetworkCost24h,
+        logs: logs,
+        globalFps: state.globalFps,
+        globalAntiLag: state.globalAntiLag,
+        resetTimestamp: state.resetTimestamp
     });
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`Server chạy trên port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));

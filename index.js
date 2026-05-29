@@ -2,27 +2,22 @@ const express = require('express');
 const app = express();
 app.use(express.json());
 
-// Lưu trữ trạng thái theo IP mạng của bạn
 const serverState = {};
-const BASE_POWER_KW = 0.04; 
+const BASE_POWER_KW = 0.04; // Điện nền gốc (40W) dùng chung cho tất cả tab
 const ELECTRICITY_RATE = 2500;
 
 app.post('/api/sync-power', (req, res) => {
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
     
-    // Khởi tạo State cho IP mới nếu chưa có
     if (!serverState[ip]) {
         serverState[ip] = { 
-            clients: {}, 
-            globalFps: 10, 
-            globalAntiLag: false, 
-            resetTimestamp: Date.now() 
+            clients: {}, globalFps: 10, globalAntiLag: false, resetTimestamp: Date.now() 
         };
     }
     const state = serverState[ip];
     const { sessionId, accountName, ram, fps, action, actionValue } = req.body;
 
-    // XỬ LÝ LỆNH ĐIỀU KHIỂN TỪ CLIENT (NẾU CÓ)
+    // Xử lý lệnh Reset Tổng Tiền (Chỉ reset tiền, không reset thời gian treo)
     if (action === "reset_cost") {
         state.resetTimestamp = Date.now();
     } else if (action === "set_fps") {
@@ -31,47 +26,75 @@ app.post('/api/sync-power', (req, res) => {
         state.globalAntiLag = Boolean(actionValue);
     }
 
-    // DỌN DẸP TAB AFK (12s không ping)
     const now = Date.now();
-    for (const id in state.clients) {
-        if (now - state.clients[id].lastPing > 12000) {
-            delete state.clients[id];
-        }
-    }
 
-    // TÍNH TOÁN CHO TAB GỬI REQUEST
+    // Cập nhật tab gửi request
     if (sessionId) {
-        const totalActiveTabs = Object.keys(state.clients).length + (state.clients[sessionId] ? 0 : 1);
-        const sharedBasePower = BASE_POWER_KW / totalActiveTabs;
-        const tabSpecificLoad = ((Number(ram) / 1000) * 0.012) + ((Number(fps) / 60) * 0.035);
-        const tabTotalKWPerHour = sharedBasePower + tabSpecificLoad;
-        
         state.clients[sessionId] = {
-            accountName: accountName || "Unknown",
+            accountName: accountName || "Unknown Acc",
             lastPing: now,
-            cost24h: tabTotalKWPerHour * 24 * ELECTRICITY_RATE
+            ram: Number(ram) || 0,
+            fps: Number(fps) || 0
         };
     }
 
-    // TỔNG HỢP LOGS VÀ TỔNG TIỀN
-    let totalNetworkCost24h = 0;
-    const logs = [];
+    // TÍNH TOÁN ĐIỆN NĂNG CHIA SẺ VÀ XÓA TAB OFFLINE QUÁ LÂU
+    let totalNetworkPowerKW = 0;
     let activeTabCount = 0;
+    let hasActive = false;
+    const logs = [];
+
     for (const id in state.clients) {
-        activeTabCount++;
-        totalNetworkCost24h += state.clients[id].cost24h;
+        const client = state.clients[id];
+        const timeSinceLastPing = now - client.lastPing;
+        
+        // Nếu quá 60s không phản hồi -> Xóa hẳn khỏi server
+        if (timeSinceLastPing > 60000) {
+            delete state.clients[id];
+            continue;
+        }
+
+        const isOffline = timeSinceLastPing > 15000; // Quá 15s -> Đánh dấu Đỏ (Offline/Văng)
+        const isLag = !isOffline && (client.ram > 2000 || client.fps < 15); // Đánh dấu Vàng (Lag)
+
+        let statusIcon = "🟢";
+        if (isOffline) statusIcon = "🔴";
+        else if (isLag) statusIcon = "🟡";
+
+        if (!isOffline) {
+            activeTabCount++;
+            hasActive = true;
+            // Tải thêm của riêng tab này
+            const tabSpecificLoad = ((client.ram / 1000) * 0.012) + ((client.fps / 60) * 0.035);
+            totalNetworkPowerKW += tabSpecificLoad;
+        }
+
+        // Tính chi phí mỗi giây cho Log
+        const sharedBase = activeTabCount > 0 ? (BASE_POWER_KW / activeTabCount) : 0;
+        const tabSpecificLoad = ((client.ram / 1000) * 0.012) + ((client.fps / 60) * 0.035);
+        const costPerSec = ((sharedBase + tabSpecificLoad) * ELECTRICITY_RATE) / 3600;
+
         logs.push({
-            name: state.clients[id].accountName,
-            cost: Math.floor(state.clients[id].cost24h)
+            name: client.accountName,
+            statusIcon: statusIcon,
+            ram: client.ram,
+            fps: client.fps,
+            costPerSec: costPerSec
         });
     }
 
-    // TRẢ VỀ DỮ LIỆU ĐỒNG BỘ CHO TẤT CẢ CÁC TAB
+    // Cộng dòng điện nền (40W) CHỈ 1 LẦN DÀNH CHO CẢ DÀN MÁY
+    if (hasActive) {
+        totalNetworkPowerKW += BASE_POWER_KW; 
+    }
+
+    // Tính tổng tiền điện 1 giây của toàn bộ dàn
+    const totalNetworkCostPerSec = (totalNetworkPowerKW * ELECTRICITY_RATE) / 3600;
+
     res.json({
         success: true,
         activeTabs: activeTabCount,
-        tabCostPer24h: state.clients[sessionId]?.cost24h || 0,
-        totalNetworkCost24h: totalNetworkCost24h,
+        totalNetworkCostPerSec: totalNetworkCostPerSec, // Trả về số tiền mỗi giây
         logs: logs,
         globalFps: state.globalFps,
         globalAntiLag: state.globalAntiLag,

@@ -2,7 +2,6 @@ const express = require('express');
 const app = express();
 app.use(express.json());
 
-// Lưu trữ bộ nhớ cache phiên làm việc
 let sessionDatabase = {}; 
 let globalSettings = {
     globalFps: 10,
@@ -13,12 +12,12 @@ let globalSettings = {
     partyOwners: {} // partyId -> accountName
 };
 
-// Vòng lặp dọn dẹp các tab mất kết nối (quá 15 giây không gửi tín hiệu)
+// Vòng lặp quét trạng thái: Quá 15 giây không gửi tín hiệu -> Chuyển sang OFFLINE chứ KHÔNG xóa log
 setInterval(() => {
     const now = Date.now();
     Object.keys(sessionDatabase).forEach(id => {
-        if (now - sessionDatabase[id].lastSeen > 15000) {
-            delete sessionDatabase[id];
+        if (sessionDatabase[id].isOnline && (now - sessionDatabase[id].lastSeen > 15000)) {
+            sessionDatabase[id].isOnline = false; // Đánh dấu đã Offline
         }
     });
 }, 5000);
@@ -27,7 +26,6 @@ app.post('/api/sync-power', (req, res) => {
     const { sessionId, partyId, accountName, ram, fps, region, incognito, action, actionValue } = req.body;
     const now = Date.now();
 
-    // 1. Xử lý các lệnh điều khiển từ xa (Actions)
     if (action) {
         if (action === "set_fps") globalSettings.globalFps = Number(actionValue);
         if (action === "toggle_antilag") globalSettings.globalAntiLag = Boolean(actionValue);
@@ -56,16 +54,14 @@ app.post('/api/sync-power', (req, res) => {
         return res.status(400).json({ success: false, error: "Missing identity data" });
     }
 
-    // 2. Xử lý logic ẨN DANH: Nếu ON, xóa sạch dữ liệu cũ/hiện tại khỏi Log hệ thống ngay lập tức
+    // Nếu bật ẩn danh, xóa hẳn khỏi database để không ai nhìn thấy
     if (incognito) {
         if (sessionDatabase[sessionId]) {
             delete sessionDatabase[sessionId];
         }
-        // Trả về dữ liệu trống an toàn để Client không bị lỗi hiển thị
         return res.json({
             success: true,
             activeTabs: 0,
-            tabCostPer24h: 0,
             totalNetworkCost24h: 0,
             totalNetworkCostPerSec: 0,
             accumulatedTotalCost: 0,
@@ -77,7 +73,7 @@ app.post('/api/sync-power', (req, res) => {
         });
     }
 
-    // 3. Cập nhật dữ liệu Session (Lọc trùng tuyệt đối bằng sessionId)
+    // Cập nhật hoặc ghi nhận mới session hoạt động (Đảm bảo On)
     sessionDatabase[sessionId] = {
         id: sessionId,
         name: accountName,
@@ -85,45 +81,42 @@ app.post('/api/sync-power', (req, res) => {
         ram: Number(ram) || 0,
         fps: Number(fps) || 0,
         region: region || "VN",
-        incognito: false,
+        isOnline: true,
         lastSeen: now
     };
 
-    // Đăng ký chủ Party nếu chưa có
     if (partyId && partyId !== "GLOBAL" && !globalSettings.partyOwners[partyId]) {
         globalSettings.partyOwners[partyId] = accountName;
     }
 
-    // 4. Tính toán Chi phí Điện Năng cho mạng chung (All Tab đang hoạt động)
     let activeTabsCount = 0;
     let totalFps = 0;
     let totalRam = 0;
     let logsList = [];
 
     Object.values(sessionDatabase).forEach(session => {
-        activeTabsCount++;
-        totalFps += session.fps;
-        totalRam += session.ram;
+        if (session.isOnline) {
+            activeTabsCount++;
+            totalFps += session.fps;
+            totalRam += session.ram;
+        }
         logsList.push({
             name: session.name,
             partyId: session.partyId,
             ram: session.ram,
             fps: session.fps,
             region: session.region,
-            incognito: false
+            isOnline: session.isOnline
         });
     });
 
-    // Công thức tính toán điện năng mạng chung
     const electricityRate = 2500; 
-    const totalLoadKW = ((totalRam / 1000) * 0.012) + ((totalFps / 60) * 0.035);
+    const totalLoadKW = ((totalRam / 1000) * 0.025) + ((totalFps / 60) * 0.035);
     const totalNetworkCostPerSec = (totalLoadKW * (electricityRate / 3600));
     
-    // Tích lũy tiền điện server theo thời gian thực (5 giây cập nhật 1 lần)
     globalSettings.accumulatedTotalCost += (totalNetworkCostPerSec * 5);
     const totalNetworkCost24h = totalNetworkCostPerSec * 86400;
 
-    // Phản hồi dữ liệu đồng bộ về Client
     res.json({
         success: true,
         activeTabs: activeTabsCount,
@@ -140,4 +133,4 @@ app.post('/api/sync-power', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server chạy tại port ${PORT}`));
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));

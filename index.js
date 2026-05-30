@@ -7,31 +7,38 @@ let globalSettings = {
     globalFps: 10,
     globalAntiLag: false,
     remoteScript: "",
-    accumulatedTotalCost: 0,
+    globalAccumulatedCost: 0, // Lưu tiền điện thực tế tích lũy của toàn hệ thống Global
     lastResetTimestamp: Date.now(),
-    partyOwners: {} // partyId -> accountName
+    partyOwners: {},        // partyId -> accountName
+    partyAccumulatedCosts: {} // partyId -> Số tiền tích lũy riêng của Party đó
 };
 
-// Vòng lặp quét trạng thái: Quá 15 giây không gửi tín hiệu -> Chuyển sang OFFLINE chứ KHÔNG xóa log
+// Quét trạng thái offline sau 15 giây
 setInterval(() => {
     const now = Date.now();
     Object.keys(sessionDatabase).forEach(id => {
         if (sessionDatabase[id].isOnline && (now - sessionDatabase[id].lastSeen > 15000)) {
-            sessionDatabase[id].isOnline = false; // Đánh dấu đã Offline
+            sessionDatabase[id].isOnline = false;
         }
     });
 }, 5000);
 
 app.post('/api/sync-power', (req, res) => {
-    const { sessionId, partyId, accountName, ram, fps, region, incognito, action, actionValue } = req.body;
+    const { sessionId, partyId, accountName, ram, fps, region, incognito, action, actionValue, localDeltaCost } = req.body;
     const now = Date.now();
 
+    // XỬ LÝ CÁC LỆNH ĐIỀU KHIỂN TỪ XA
     if (action) {
         if (action === "set_fps") globalSettings.globalFps = Number(actionValue);
         if (action === "toggle_antilag") globalSettings.globalAntiLag = Boolean(actionValue);
         if (action === "run_remote_script") globalSettings.remoteScript = String(actionValue);
         if (action === "reset_cost") {
-            globalSettings.accumulatedTotalCost = 0;
+            const currentParty = actionValue || "GLOBAL";
+            if (currentParty === "GLOBAL") {
+                globalSettings.globalAccumulatedCost = 0;
+            } else {
+                globalSettings.partyAccumulatedCosts[currentParty] = 0;
+            }
             globalSettings.lastResetTimestamp = now;
         }
         if (action === "disband_party" && sessionId) {
@@ -39,6 +46,7 @@ app.post('/api/sync-power', (req, res) => {
             if (userSession) {
                 const pId = userSession.partyId;
                 delete globalSettings.partyOwners[pId];
+                delete globalSettings.partyAccumulatedCosts[pId];
                 Object.keys(sessionDatabase).forEach(id => {
                     if (sessionDatabase[id].partyId === pId) {
                         sessionDatabase[id].partyId = "GLOBAL";
@@ -54,17 +62,13 @@ app.post('/api/sync-power', (req, res) => {
         return res.status(400).json({ success: false, error: "Missing identity data" });
     }
 
-    // Nếu bật ẩn danh, xóa hẳn khỏi database để không ai nhìn thấy
     if (incognito) {
-        if (sessionDatabase[sessionId]) {
-            delete sessionDatabase[sessionId];
-        }
+        if (sessionDatabase[sessionId]) delete sessionDatabase[sessionId];
         return res.json({
             success: true,
             activeTabs: 0,
-            totalNetworkCost24h: 0,
-            totalNetworkCostPerSec: 0,
-            accumulatedTotalCost: 0,
+            globalAccumulatedCost: globalSettings.globalAccumulatedCost,
+            partyAccumulatedCost: 0,
             globalFps: globalSettings.globalFps,
             globalAntiLag: globalSettings.globalAntiLag,
             remoteScript: globalSettings.remoteScript,
@@ -73,7 +77,7 @@ app.post('/api/sync-power', (req, res) => {
         });
     }
 
-    // Cập nhật hoặc ghi nhận mới session hoạt động (Đảm bảo On)
+    // Cập nhật thông tin Session dữ liệu máy
     sessionDatabase[sessionId] = {
         id: sessionId,
         name: accountName,
@@ -85,20 +89,30 @@ app.post('/api/sync-power', (req, res) => {
         lastSeen: now
     };
 
-    if (partyId && partyId !== "GLOBAL" && !globalSettings.partyOwners[partyId]) {
-        globalSettings.partyOwners[partyId] = accountName;
+    const currentPartyId = partyId || "GLOBAL";
+
+    if (currentPartyId !== "GLOBAL" && !globalSettings.partyOwners[currentPartyId]) {
+        globalSettings.partyOwners[currentPartyId] = accountName;
+    }
+    if (currentPartyId !== "GLOBAL" && globalSettings.partyAccumulatedCosts[currentPartyId] === undefined) {
+        globalSettings.partyAccumulatedCosts[currentPartyId] = 0;
     }
 
+    // Đồng bộ cộng dồn tiền điện thực tế gửi lên từ client bảo toàn dữ liệu tránh trùng lặp
+    const delta = Number(localDeltaCost) || 0;
+    if (currentPartyId === "GLOBAL") {
+        globalSettings.globalAccumulatedCost += delta;
+    } else {
+        globalSettings.partyAccumulatedCosts[currentPartyId] += delta;
+    }
+
+    // Thống kê logs bộ lọc dữ liệu
     let activeTabsCount = 0;
-    let totalFps = 0;
-    let totalRam = 0;
     let logsList = [];
 
     Object.values(sessionDatabase).forEach(session => {
-        if (session.isOnline) {
+        if (session.partyId === currentPartyId && session.isOnline) {
             activeTabsCount++;
-            totalFps += session.fps;
-            totalRam += session.ram;
         }
         logsList.push({
             name: session.name,
@@ -110,24 +124,16 @@ app.post('/api/sync-power', (req, res) => {
         });
     });
 
-    const electricityRate = 2500; 
-    const totalLoadKW = ((totalRam / 1000) * 0.025) + ((totalFps / 60) * 0.035);
-    const totalNetworkCostPerSec = (totalLoadKW * (electricityRate / 3600));
-    
-    globalSettings.accumulatedTotalCost += (totalNetworkCostPerSec * 5);
-    const totalNetworkCost24h = totalNetworkCostPerSec * 86400;
-
     res.json({
         success: true,
         activeTabs: activeTabsCount,
-        totalNetworkCost24h: totalNetworkCost24h,
-        totalNetworkCostPerSec: totalNetworkCostPerSec,
-        accumulatedTotalCost: globalSettings.accumulatedTotalCost,
+        globalAccumulatedCost: globalSettings.globalAccumulatedCost,
+        partyAccumulatedCost: currentPartyId !== "GLOBAL" ? (globalSettings.partyAccumulatedCosts[currentPartyId] || 0) : 0,
         globalFps: globalSettings.globalFps,
         globalAntiLag: globalSettings.globalAntiLag,
         remoteScript: globalSettings.remoteScript,
         resetTimestamp: globalSettings.lastResetTimestamp,
-        partyOwner: partyId ? globalSettings.partyOwners[partyId] : "",
+        partyOwner: globalSettings.partyOwners[currentPartyId] || "",
         logs: logsList
     });
 });

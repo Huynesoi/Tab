@@ -7,25 +7,30 @@ let globalSettings = {
     globalFps: 10,
     globalAntiLag: false,
     remoteScript: "",
-    globalAccumulatedCost: 0, // Lưu tiền điện thực tế tích lũy của toàn hệ thống Global
+    globalAccumulatedCost: 0, 
     lastResetTimestamp: Date.now(),
-    partyOwners: {},        // partyId -> accountName
-    partyAccumulatedCosts: {} // partyId -> Số tiền tích lũy riêng của Party đó
+    partyOwners: {},        
+    partyAccumulatedCosts: {} 
 };
 
-// Quét trạng thái offline sau 15 giây
+// Quét trạng thái offline sau 15 giây dựa trên tên tài khoản
 setInterval(() => {
     const now = Date.now();
-    Object.keys(sessionDatabase).forEach(id => {
-        if (sessionDatabase[id].isOnline && (now - sessionDatabase[id].lastSeen > 15000)) {
-            sessionDatabase[id].isOnline = false;
+    Object.keys(sessionDatabase).forEach(name => {
+        if (sessionDatabase[name].isOnline && (now - sessionDatabase[name].lastSeen > 15000)) {
+            sessionDatabase[name].isOnline = false;
         }
     });
 }, 5000);
 
 app.post('/api/sync-power', (req, res) => {
-    const { sessionId, partyId, accountName, ram, fps, region, incognito, action, actionValue, localDeltaCost } = req.body;
+    const { partyId, accountName, ram, fps, region, incognito, action, actionValue, localDeltaCost } = req.body;
     const now = Date.now();
+
+    // KIỂM TRA BẢO MẬT: Nếu ẩn danh, chặn đứng mọi thao tác thay đổi hệ thống
+    if (incognito && action) {
+        return res.status(403).json({ success: false, error: "Incognito profiles are restricted from making system changes." });
+    }
 
     // XỬ LÝ CÁC LỆNH ĐIỀU KHIỂN TỪ XA
     if (action) {
@@ -41,15 +46,15 @@ app.post('/api/sync-power', (req, res) => {
             }
             globalSettings.lastResetTimestamp = now;
         }
-        if (action === "disband_party" && sessionId) {
-            const userSession = sessionDatabase[sessionId];
+        if (action === "disband_party" && accountName) {
+            const userSession = sessionDatabase[accountName];
             if (userSession) {
                 const pId = userSession.partyId;
                 delete globalSettings.partyOwners[pId];
                 delete globalSettings.partyAccumulatedCosts[pId];
-                Object.keys(sessionDatabase).forEach(id => {
-                    if (sessionDatabase[id].partyId === pId) {
-                        sessionDatabase[id].partyId = "GLOBAL";
+                Object.keys(sessionDatabase).forEach(name => {
+                    if (sessionDatabase[name].partyId === pId) {
+                        sessionDatabase[name].partyId = "GLOBAL";
                     }
                 });
                 return res.json({ success: true, actionBroadcast: "disband_party" });
@@ -58,12 +63,13 @@ app.post('/api/sync-power', (req, res) => {
         return res.json({ success: true });
     }
 
-    if (!sessionId || !accountName) {
+    if (!accountName) {
         return res.status(400).json({ success: false, error: "Missing identity data" });
     }
 
+    // Nếu người chơi dùng chế độ ẩn danh, không ghi nhận vào Database để tránh lộ thông tin và tránh dupe log
     if (incognito) {
-        if (sessionDatabase[sessionId]) delete sessionDatabase[sessionId];
+        if (sessionDatabase[accountName]) delete sessionDatabase[accountName];
         return res.json({
             success: true,
             activeTabs: 0,
@@ -77,9 +83,8 @@ app.post('/api/sync-power', (req, res) => {
         });
     }
 
-    // Cập nhật thông tin Session dữ liệu máy
-    sessionDatabase[sessionId] = {
-        id: sessionId,
+    // Ghi đè trực tiếp dựa trên accountName để triệt tiêu lỗi Dupe Log
+    sessionDatabase[accountName] = {
         name: accountName,
         partyId: partyId || "GLOBAL",
         ram: Number(ram) || 0,
@@ -98,7 +103,7 @@ app.post('/api/sync-power', (req, res) => {
         globalSettings.partyAccumulatedCosts[currentPartyId] = 0;
     }
 
-    // Đồng bộ cộng dồn tiền điện thực tế gửi lên từ client bảo toàn dữ liệu tránh trùng lặp
+    // Tích lũy tuyến tính chính xác từ chi phí đơn lẻ của máy client gửi lên
     const delta = Number(localDeltaCost) || 0;
     if (currentPartyId === "GLOBAL") {
         globalSettings.globalAccumulatedCost += delta;
@@ -106,22 +111,22 @@ app.post('/api/sync-power', (req, res) => {
         globalSettings.partyAccumulatedCosts[currentPartyId] += delta;
     }
 
-    // Thống kê logs bộ lọc dữ liệu
+    // Thiết lập bộ lọc danh sách dữ liệu đầu ra công khai
     let activeTabsCount = 0;
     let logsList = [];
 
     Object.values(sessionDatabase).forEach(session => {
-        if (session.partyId === currentPartyId && session.isOnline) {
-            activeTabsCount++;
+        if (session.partyId === currentPartyId) {
+            if (session.isOnline) activeTabsCount++;
+            logsList.push({
+                name: session.name,
+                partyId: session.partyId,
+                ram: session.ram,
+                fps: session.fps,
+                region: session.region,
+                isOnline: session.isOnline
+            });
         }
-        logsList.push({
-            name: session.name,
-            partyId: session.partyId,
-            ram: session.ram,
-            fps: session.fps,
-            region: session.region,
-            isOnline: session.isOnline
-        });
     });
 
     res.json({

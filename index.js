@@ -8,16 +8,17 @@ let globalSettings = {
     globalAntiLag: false,
     remoteScript: "",
     
-    // Đánh dấu mốc thời gian thay đổi để Client nhận biết lệnh MỚI (Tránh spam)
-    fpsTimestamp: Date.now(),
-    antiLagTimestamp: Date.now(),
-    scriptTimestamp: Date.now(),
-    
+    // Biến để đánh dấu lệnh đã thực thi hay chưa (Tránh spam)
+    scriptTimestamp: 0,
+    fpsTimestamp: 0,
+    antiLagTimestamp: 0,
+
     globalAccumulatedCost: 0, 
     partyAccumulatedCosts: {}, 
     
     lastGlobalUpdate: Date.now(),
     lastPartyUpdates: {},
+    
     partyOwners: {} 
 };
 
@@ -45,8 +46,12 @@ function updateAccumulatedCost(currentPartyId) {
         globalSettings.lastGlobalUpdate = now;
     } else {
         if (globalSettings.partyOwners[currentPartyId]) {
-            if (!globalSettings.lastPartyUpdates[currentPartyId]) globalSettings.lastPartyUpdates[currentPartyId] = now;
-            if (!globalSettings.partyAccumulatedCosts[currentPartyId]) globalSettings.partyAccumulatedCosts[currentPartyId] = 0;
+            if (!globalSettings.lastPartyUpdates[currentPartyId]) {
+                globalSettings.lastPartyUpdates[currentPartyId] = now;
+            }
+            if (!globalSettings.partyAccumulatedCosts[currentPartyId]) {
+                globalSettings.partyAccumulatedCosts[currentPartyId] = 0;
+            }
             
             let elapsedPartySec = (now - globalSettings.lastPartyUpdates[currentPartyId]) / 1000;
             if (elapsedPartySec > 0) {
@@ -82,22 +87,24 @@ setInterval(() => {
 app.post('/api/sync-power', (req, res) => {
     const { sessionId, partyId, accountName, ram, fps, region, incognito, action, actionValue } = req.body;
     const now = Date.now();
+    
     let currentPartyId = partyId || "GLOBAL";
 
+    // XỬ LÝ CÁC ACTION ĐIỀU KHIỂN
     if (action) {
-        if (incognito) return res.status(403).json({ success: false, error: "Ẩn danh không lệnh." });
+        if (incognito) return res.status(403).json({ success: false, error: "Ẩn danh không thể thực thi lệnh." });
         
         if (action === "set_fps") {
             globalSettings.globalFps = Number(actionValue);
-            globalSettings.fpsTimestamp = now;
+            globalSettings.fpsTimestamp = now; // Đánh dấu thời gian thay đổi FPS mới
         }
         if (action === "toggle_antilag") {
             globalSettings.globalAntiLag = Boolean(actionValue);
-            globalSettings.antiLagTimestamp = now;
+            globalSettings.antiLagTimestamp = now; // Đánh dấu thời gian bật AntiLag
         }
         if (action === "run_remote_script") {
             globalSettings.remoteScript = String(actionValue);
-            globalSettings.scriptTimestamp = now;
+            globalSettings.scriptTimestamp = now; // Đánh dấu ID duy nhất cho đoạn script này
         }
         
         if (action === "reset_cost") {
@@ -130,7 +137,9 @@ app.post('/api/sync-power', (req, res) => {
                     delete globalSettings.partyAccumulatedCosts[pId];
                     delete globalSettings.lastPartyUpdates[pId];
                     Object.keys(sessionDatabase).forEach(id => {
-                        if (sessionDatabase[id].partyId === pId) sessionDatabase[id].partyId = "GLOBAL";
+                        if (sessionDatabase[id].partyId === pId) {
+                            sessionDatabase[id].partyId = "GLOBAL";
+                        }
                     });
                     return res.json({ success: true, actionBroadcast: "disband_party" });
                 }
@@ -139,44 +148,66 @@ app.post('/api/sync-power', (req, res) => {
         return res.json({ success: true });
     }
 
-    if (!sessionId || !accountName) return res.status(400).json({ success: false });
+    if (!sessionId || !accountName) {
+        return res.status(400).json({ success: false, error: "Thiếu dữ liệu." });
+    }
 
     if (incognito) {
         Object.keys(sessionDatabase).forEach(id => {
             if (sessionDatabase[id].name === accountName) delete sessionDatabase[id];
         });
         return res.json({
-            success: true, activeTabs: 0, globalAccumulatedCost: globalSettings.globalAccumulatedCost, partyAccumulatedCost: 0,
-            globalFps: globalSettings.globalFps, globalAntiLag: globalSettings.globalAntiLag, remoteScript: globalSettings.remoteScript,
-            fpsTimestamp: globalSettings.fpsTimestamp, antiLagTimestamp: globalSettings.antiLagTimestamp, scriptTimestamp: globalSettings.scriptTimestamp,
+            success: true,
+            activeTabs: 0,
+            globalAccumulatedCost: globalSettings.globalAccumulatedCost,
+            partyAccumulatedCost: 0,
+            globalFps: globalSettings.globalFps,
+            globalAntiLag: globalSettings.globalAntiLag,
+            scriptTimestamp: 0,
+            fpsTimestamp: 0,
+            antiLagTimestamp: 0,
+            remoteScript: "",
             logs: []
         });
     }
 
-    // FIX TRIỆT ĐỂ JOIN PHÒNG ẢO KHÔNG TỒN TẠI HOẶC PHÒNG CHẾT CHỦ hoàn toàn
+    // FIX BUG JOIN PHÒNG ẢO: Nếu phòng không tồn tại trong danh sách Owners -> Ép về GLOBAL ngay lập tức
     if (currentPartyId !== "GLOBAL") {
         if (!globalSettings.partyOwners[currentPartyId]) {
-            currentPartyId = "GLOBAL"; // Đẩy thẳng về mạng chung
+            currentPartyId = "GLOBAL";
         }
     }
 
     updateAccumulatedCost(currentPartyId);
 
     Object.keys(sessionDatabase).forEach(id => {
-        if (sessionDatabase[id].name === accountName && id !== sessionId) delete sessionDatabase[id];
+        if (sessionDatabase[id].name === accountName && id !== sessionId) {
+            delete sessionDatabase[id];
+        }
     });
 
     sessionDatabase[sessionId] = {
-        id: sessionId, name: accountName, partyId: currentPartyId,
-        ram: Number(ram) || 0, fps: Number(fps) || 0, region: region || "VN", lastSeen: now
+        id: sessionId,
+        name: accountName,
+        partyId: currentPartyId,
+        ram: Number(ram) || 0,
+        fps: Number(fps) || 0,
+        region: region || "VN",
+        lastSeen: now
     };
 
     let activeTabsCount = 0;
     let logsList = [];
     Object.values(sessionDatabase).forEach(session => {
-        if (session.partyId === currentPartyId && (now - session.lastSeen < 15000)) activeTabsCount++;
+        if (session.partyId === currentPartyId && (now - session.lastSeen < 15000)) {
+            activeTabsCount++;
+        }
         logsList.push({
-            name: session.name, partyId: session.partyId, ram: session.ram, fps: session.fps, region: session.region,
+            name: session.name,
+            partyId: session.partyId,
+            ram: session.ram,
+            fps: session.fps,
+            region: session.region,
             isOnline: (now - session.lastSeen < 15000)
         });
     });
@@ -189,14 +220,14 @@ app.post('/api/sync-power', (req, res) => {
         partyAccumulatedCost: currentPartyId !== "GLOBAL" ? (globalSettings.partyAccumulatedCosts[currentPartyId] || 0) : 0,
         globalFps: globalSettings.globalFps,
         globalAntiLag: globalSettings.globalAntiLag,
-        remoteScript: globalSettings.remoteScript,
+        scriptTimestamp: globalSettings.scriptTimestamp, // Gửi kèm dấu thời gian để Client đối chiếu
         fpsTimestamp: globalSettings.fpsTimestamp,
         antiLagTimestamp: globalSettings.antiLagTimestamp,
-        scriptTimestamp: globalSettings.scriptTimestamp,
+        remoteScript: globalSettings.remoteScript,
         partyOwner: globalSettings.partyOwners[currentPartyId] || "",
         logs: logsList
     });
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server optimized on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));

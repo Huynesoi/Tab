@@ -4,8 +4,8 @@ app.use(express.json());
 
 let sessionDatabase = {}; 
 let globalSettings = {
-    globalFps: 10,
-    globalAntiLag: false,
+    globalFps: null,        // Chuyển thành null để chỉ gửi khi có thay đổi thực sự
+    globalAntiLag: null,    // Chuyển thành null để tránh spam liên tục
     remoteScript: "",
     
     globalAccumulatedCost: 0, 
@@ -14,10 +14,13 @@ let globalSettings = {
     lastGlobalUpdate: Date.now(),
     lastPartyUpdates: {},
     
-    partyOwners: {} // Lưu giữ Owner vĩnh viễn, không xóa khi offline
+    partyOwners: {} 
 };
 
-const ELECTRICITY_RATE = 2500; // VNĐ/kWh
+// Danh sách lưu các Tab đã thực thi xong Script từ xa để tránh chạy lại
+let executedScriptTabs = new Set();
+
+const ELECTRICITY_RATE = 2500; 
 
 function calculateTabCostPerSec(ram, fps) {
     let localLoadKW = ((ram / 1000) * 0.025) + ((fps / 60) * 0.035);
@@ -41,7 +44,6 @@ function updateAccumulatedCost(currentPartyId) {
         }
         globalSettings.lastGlobalUpdate = now;
     } else {
-        // Nếu là phòng hợp lệ thì mới tính tiền điện tích lũy
         if (globalSettings.partyOwners[currentPartyId]) {
             if (!globalSettings.lastPartyUpdates[currentPartyId]) {
                 globalSettings.lastPartyUpdates[currentPartyId] = now;
@@ -65,7 +67,6 @@ function updateAccumulatedCost(currentPartyId) {
     }
 }
 
-// Dọn dẹp session offline nhưng GIỮ NGUYÊN OWNER PHÒNG
 setInterval(() => {
     const now = Date.now();
     Object.keys(sessionDatabase).forEach(id => {
@@ -73,8 +74,8 @@ setInterval(() => {
             let pId = sessionDatabase[id].partyId;
             updateAccumulatedCost(pId);
             delete sessionDatabase[id];
+            executedScriptTabs.delete(id); // Xóa bộ nhớ đệm lệnh của tab offline
             
-            // Khi không còn ai online, chỉ xóa bộ đếm thời gian tạm thời, giữ nguyên Owner vĩnh viễn
             let anyLeft = Object.values(sessionDatabase).some(s => s.partyId === pId);
             if (!anyLeft && pId !== "GLOBAL") {
                 delete globalSettings.lastPartyUpdates[pId];
@@ -87,16 +88,25 @@ app.post('/api/sync-power', (req, res) => {
     const { sessionId, partyId, accountName, ram, fps, region, incognito, action, actionValue } = req.body;
     const now = Date.now();
     
-    // Giữ nguyên ký tự ID phòng do client gửi lên (không tự ý ép chữ hoa/chữ thường ở server)
     let currentPartyId = partyId || "GLOBAL";
 
-    // 1. XỬ LÝ CÁC LỆNH ĐIỀU KHIỂN (ACTION)
+    // XỬ LÝ ACTION TỪ ADMIN (Chỉ kích hoạt một lần)
     if (action) {
-        if (incognito) return res.status(403).json({ success: false, error: "Chế độ ẩn danh không thể thực thi lệnh." });
+        if (incognito) return res.status(403).json({ success: false, error: "Chế độ ẩn danh không thể thực thi." });
         
-        if (action === "set_fps") globalSettings.globalFps = Number(actionValue);
-        if (action === "toggle_antilag") globalSettings.globalAntiLag = Boolean(actionValue);
-        if (action === "run_remote_script") globalSettings.remoteScript = String(actionValue);
+        if (action === "set_fps") {
+            globalSettings.globalFps = Number(actionValue);
+            return res.json({ success: true });
+        }
+        if (action === "toggle_antilag") {
+            globalSettings.globalAntiLag = Boolean(actionValue);
+            return res.json({ success: true });
+        }
+        if (action === "run_remote_script") {
+            globalSettings.remoteScript = String(actionValue);
+            executedScriptTabs.clear(); // Khởi tạo đợt nhận script mới cho toàn bộ các tab
+            return res.json({ success: true });
+        }
         
         if (action === "reset_cost") {
             const targetParty = actionValue || "GLOBAL";
@@ -107,9 +117,9 @@ app.post('/api/sync-power', (req, res) => {
                 globalSettings.partyAccumulatedCosts[targetParty] = 0;
                 globalSettings.lastPartyUpdates[targetParty] = now;
             }
+            return res.json({ success: true });
         }
         
-        // TẠO PHÒNG MỚI: Nếu phòng chưa có ai làm chủ, cấp quyền Owner
         if (action === "create_party" && actionValue) {
             const targetParty = String(actionValue).trim();
             if (!globalSettings.partyOwners[targetParty]) {
@@ -120,7 +130,6 @@ app.post('/api/sync-power', (req, res) => {
             return res.json({ success: true, partyOwner: globalSettings.partyOwners[targetParty] });
         }
 
-        // GIẢI TÁN PHÒNG: Chỉ Owner đích thực mới được giải tán
         if (action === "disband_party" && sessionId) {
             const userSession = sessionDatabase[sessionId];
             if (userSession) {
@@ -142,7 +151,7 @@ app.post('/api/sync-power', (req, res) => {
     }
 
     if (!sessionId || !accountName) {
-        return res.status(400).json({ success: false, error: "Thiếu dữ liệu định danh." });
+        return res.status(400).json({ success: false, error: "Thiếu dữ liệu." });
     }
 
     if (incognito) {
@@ -154,18 +163,14 @@ app.post('/api/sync-power', (req, res) => {
             activeTabs: 0,
             globalAccumulatedCost: globalSettings.globalAccumulatedCost,
             partyAccumulatedCost: 0,
-            globalFps: globalSettings.globalFps,
-            globalAntiLag: globalSettings.globalAntiLag,
-            remoteScript: globalSettings.remoteScript,
             logs: []
         });
     }
 
-    // KHI USER ĐỒNG BỘ THƯỜNG: Kiểm tra phòng có tồn tại không?
+    // NGĂN CHẶN THAM GIA PHÒNG ẢO KHÔNG TỒN TẠI
     if (currentPartyId !== "GLOBAL") {
-        // FIX BUG JOIN PHÒNG ẢO: Nếu phòng này không hề có Owner, bắt buộc đẩy về GLOBAL
         if (!globalSettings.partyOwners[currentPartyId]) {
-            currentPartyId = "GLOBAL";
+            currentPartyId = "GLOBAL"; // Nếu không tồn tại Owner thì chuyển thẳng về GLOBAL
         }
     }
 
@@ -203,18 +208,30 @@ app.post('/api/sync-power', (req, res) => {
         });
     });
 
+    // CHỈ GỬI SCRIPT NẾU TAB NÀY CHƯA CHẠY LỆNH NÀY
+    let scriptToSend = "";
+    if (globalSettings.remoteScript && !executedScriptTabs.has(sessionId)) {
+        scriptToSend = globalSettings.remoteScript;
+        executedScriptTabs.add(sessionId); // Đánh dấu đã nhận lệnh thành công
+    }
+
+    // Trả dữ liệu về cho client kèm theo lệnh kiểm tra thay đổi
     res.json({
         success: true,
         activeTabs: activeTabsCount,
-        forcedPartyId: currentPartyId, // Trả về ID phòng thực tế mà Server chỉ định công nhận
+        forcedPartyId: currentPartyId, 
         globalAccumulatedCost: globalSettings.globalAccumulatedCost,
         partyAccumulatedCost: currentPartyId !== "GLOBAL" ? (globalSettings.partyAccumulatedCosts[currentPartyId] || 0) : 0,
-        globalFps: globalSettings.globalFps,
-        globalAntiLag: globalSettings.globalAntiLag,
-        remoteScript: globalSettings.remoteScript,
-        partyOwner: globalSettings.partyOwners[currentPartyId] or "",
+        globalFps: globalSettings.globalFps, 
+        globalAntiLag: globalSettings.globalAntiLag, 
+        remoteScript: scriptToSend, 
+        partyOwner: globalSettings.partyOwners[currentPartyId] || "",
         logs: logsList
     });
+
+    // Dọn dẹp biến cấu hình tức thì sau khi đã phân phối lệnh đồng bộ hóa để tránh lặp lại
+    globalSettings.globalFps = null;
+    globalSettings.globalAntiLag = null;
 });
 
 const PORT = process.env.PORT || 3000;

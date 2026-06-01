@@ -8,11 +8,11 @@ let globalSettings = {
     globalAntiLag: false,
     remoteScript: "",
     
-    // TIỀN ĐIỆN LƯU TRÊN SERVER
+    // TIỀN ĐIỆN TÍCH LŨY LƯU TRÊN SERVER
     globalAccumulatedCost: 0, 
     partyAccumulatedCosts: {}, 
     
-    // TIMESTAMPS ĐỂ TÍNH TIỀN THEO THỜI GIAN THỰC
+    // TIMESTAMP LẦN CẬP NHẬT GẦN NHẤT CỦA PHÂN VÙNG (DÙNG ĐỂ TÍNH DELTA TIME)
     lastGlobalUpdate: Date.now(),
     lastPartyUpdates: {},
     
@@ -21,80 +21,79 @@ let globalSettings = {
 
 const ELECTRICITY_RATE = 2500; // VNĐ/kWh
 
-// Hàm tính toán chi phí điện dựa trên RAM và FPS trung bình
-function calculateTabCostPerSec(ram, fps) do {
+// Hàm tính toán chi phí điện của 1 tab dựa trên cấu hình RAM và FPS
+function calculateTabCostPerSec(ram, fps) {
     let localLoadKW = ((ram / 1000) * 0.025) + ((fps / 60) * 0.035);
     if (localLoadKW < 0.015) localLoadKW = 0.015;
     return localLoadKW * (ELECTRICITY_RATE / 3600);
 }
 
-// Cập nhật trạng thái Online/Offline định kỳ và tính toán tiền điện tích lũy tự động
-setInterval(() => {
+// Hàm cập nhật tiền điện tích lũy ngay khi có tương tác (Realtime Event-Driven)
+function updateAccumulatedCost(currentPartyId) {
     const now = Date.now();
     
-    // 1. Tính toán cho sảnh GLOBAL
-    let activeGlobalTabs = 0;
-    let totalGlobalCostSec = 0;
-    
-    Object.values(sessionDatabase).forEach(session => {
-        if (session.partyId === "GLOBAL" && (now - session.lastSeen < 15000)) {
-            activeGlobalTabs++;
-            totalGlobalCostSec += calculateTabCostPerSec(session.ram, session.fps);
+    if (currentPartyId === "GLOBAL") {
+        let elapsedGlobalSec = (now - globalSettings.lastGlobalUpdate) / 1000;
+        if (elapsedGlobalSec > 0) {
+            let totalGlobalCostSec = 0;
+            Object.values(sessionDatabase).forEach(session => {
+                if (session.partyId === "GLOBAL" && (now - session.lastSeen < 15000)) {
+                    totalGlobalCostSec += calculateTabCostPerSec(session.ram, session.fps);
+                }
+            });
+            globalSettings.globalAccumulatedCost += (totalGlobalCostSec * elapsedGlobalSec);
         }
-    });
-    
-    let elapsedGlobalSec = (now - globalSettings.lastGlobalUpdate) / 1000;
-    if (elapsedGlobalSec > 0 && activeGlobalTabs > 0) {
-        globalSettings.globalAccumulatedCost += (totalGlobalCostSec * elapsedGlobalSec);
-    }
-    globalSettings.lastGlobalUpdate = now;
-
-    // 2. Tính toán cho các phòng PARTY
-    let partyGroups = {};
-    Object.values(sessionDatabase).forEach(session => {
-        if (session.partyId !== "GLOBAL" && (now - session.lastSeen < 15000)) {
-            if (!partyGroups[session.partyId]) partyGroups[session.partyId] = [];
-            partyGroups[session.partyId].push(session);
+        globalSettings.lastGlobalUpdate = now;
+    } else {
+        if (!globalSettings.lastPartyUpdates[currentPartyId]) {
+            globalSettings.lastPartyUpdates[currentPartyId] = now;
         }
-    });
-
-    Object.keys(partyGroups).forEach(pId => {
-        let tabsInParty = partyGroups[pId];
-        let totalPartyCostSec = 0;
-        tabsInParty.forEach(s => {
-            totalPartyCostSec += calculateTabCostPerSec(s.ram, s.fps);
-        });
-
-        if (!globalSettings.partyAccumulatedCosts[pId]) globalSettings.partyAccumulatedCosts[pId] = 0;
-        if (!globalSettings.lastPartyUpdates[pId]) globalSettings.lastPartyUpdates[pId] = now;
-
-        let elapsedPartySec = (now - globalSettings.lastPartyUpdates[pId]) / 1000;
+        if (!globalSettings.partyAccumulatedCosts[currentPartyId]) {
+            globalSettings.partyAccumulatedCosts[currentPartyId] = 0;
+        }
+        
+        let elapsedPartySec = (now - globalSettings.lastPartyUpdates[currentPartyId]) / 1000;
         if (elapsedPartySec > 0) {
-            globalSettings.partyAccumulatedCosts[pId] += (totalPartyCostSec * elapsedPartySec);
+            let totalPartyCostSec = 0;
+            Object.values(sessionDatabase).forEach(session => {
+                if (session.partyId === currentPartyId && (now - session.lastSeen < 15000)) {
+                    totalPartyCostSec += calculateTabCostPerSec(session.ram, session.fps);
+                }
+            });
+            globalSettings.partyAccumulatedCosts[currentPartyId] += (totalPartyCostSec * elapsedPartySec);
         }
-        globalSettings.lastPartyUpdates[pId] = now;
-    });
+        globalSettings.lastPartyUpdates[currentPartyId] = now;
+    }
+}
 
-    // 3. Quét dọn các Session ngắt kết nối quá lâu
+// setInterval giờ CHỈ làm nhiệm vụ quét dọn các tab mất kết nối (Không tính tiền ở đây nữa để tránh lệch chu kỳ)
+setInterval(() => {
+    const now = Date.now();
     Object.keys(sessionDatabase).forEach(id => {
-        if (now - sessionDatabase[id].lastSeen > 20000) {
+        if (now - sessionDatabase[id].lastSeen > 20000) { // Quá 20s không sync -> Offline
             let pId = sessionDatabase[id].partyId;
+            
+            // Cập nhật tiền điện lần cuối trước khi xóa session đó
+            updateAccumulatedCost(pId);
+            
             delete sessionDatabase[id];
             
-            // Nếu phòng không còn ai online, dọn dẹp owner luôn
+            // Nếu phòng không còn ai online, dọn dẹp owner và bộ đếm thời gian phòng đó
             let anyLeft = Object.values(sessionDatabase).some(s => s.partyId === pId);
             if (!anyLeft && pId !== "GLOBAL") {
                 delete globalSettings.partyOwners[pId];
+                delete globalSettings.lastPartyUpdates[pId];
             }
         }
     });
-}, 2000);
+}, 5000);
 
 app.post('/api/sync-power', (req, res) => {
     const { sessionId, partyId, accountName, ram, fps, region, incognito, action, actionValue } = req.body;
     const now = Date.now();
+    const currentPartyId = partyId || "GLOBAL";
 
-    // Xử lý các lệnh điều khiển từ Admin / Owner
+    // 1. LỆNH ĐIỀU KHIỂN TỪ ADMIN / OWNER
     if (action) {
         if (incognito) return res.status(403).json({ success: false, error: "Chế độ ẩn danh không thể thực thi lệnh." });
         
@@ -103,18 +102,21 @@ app.post('/api/sync-power', (req, res) => {
         if (action === "run_remote_script") globalSettings.remoteScript = String(actionValue);
         
         if (action === "reset_cost") {
-            const currentParty = actionValue || "GLOBAL";
-            if (currentParty === "GLOBAL") {
+            const targetParty = actionValue || "GLOBAL";
+            if (targetParty === "GLOBAL") {
                 globalSettings.globalAccumulatedCost = 0;
+                globalSettings.lastGlobalUpdate = now;
             } else {
-                globalSettings.partyAccumulatedCosts[currentParty] = 0;
+                globalSettings.partyAccumulatedCosts[targetParty] = 0;
+                globalSettings.lastPartyUpdates[targetParty] = now;
             }
         }
         
         if (action === "create_party" && sessionId && actionValue) {
-            // KHÓA CỨNG QUYỀN OWNER: Chỉ cho phép người tạo đầu tiên giữ quyền
             if (!globalSettings.partyOwners[actionValue]) {
                 globalSettings.partyOwners[actionValue] = accountName;
+                globalSettings.partyAccumulatedCosts[actionValue] = globalSettings.partyAccumulatedCosts[actionValue] || 0;
+                globalSettings.lastPartyUpdates[actionValue] = now;
             }
             return res.json({ success: true, partyOwner: globalSettings.partyOwners[actionValue] });
         }
@@ -125,6 +127,7 @@ app.post('/api/sync-power', (req, res) => {
                 const pId = userSession.partyId;
                 delete globalSettings.partyOwners[pId];
                 delete globalSettings.partyAccumulatedCosts[pId];
+                delete globalSettings.lastPartyUpdates[pId];
                 Object.keys(sessionDatabase).forEach(id => {
                     if (sessionDatabase[id].partyId === pId) {
                         sessionDatabase[id].partyId = "GLOBAL";
@@ -140,7 +143,7 @@ app.post('/api/sync-power', (req, res) => {
         return res.status(400).json({ success: false, error: "Thiếu dữ liệu định danh." });
     }
 
-    // Chế độ ẩn danh (Chỉ nhận dữ liệu đồng bộ chung từ sảnh, không lưu trữ thông tin lên Server)
+    // 2. XỬ LÝ CHẾ ĐỘ ẨN DANH (Chỉ lấy cấu hình về, không đẩy data lên hệ thống)
     if (incognito) {
         Object.keys(sessionDatabase).forEach(id => {
             if (sessionDatabase[id].name === accountName) delete sessionDatabase[id];
@@ -157,27 +160,28 @@ app.post('/api/sync-power', (req, res) => {
         });
     }
 
-    // Xóa session trùng lặp của cùng một accountName (Fix Dupe Log)
+    // 3. XỬ LÝ ĐỒNG BỘ THƯỜNG (Cập nhật tiền điện TRƯỚC KHI thay đổi thông số phần cứng mới)
+    updateAccumulatedCost(currentPartyId);
+
+    // Xóa session trùng lặp nếu trùng tên nhưng khác GUID máy
     Object.keys(sessionDatabase).forEach(id => {
         if (sessionDatabase[id].name === accountName && id !== sessionId) {
             delete sessionDatabase[id];
         }
     });
 
-    // Cập nhật thông tin tài khoản vào DB
+    // Cập nhật thông số mới của Tab vào DB
     sessionDatabase[sessionId] = {
         id: sessionId,
         name: accountName,
-        partyId: partyId || "GLOBAL",
+        partyId: currentPartyId,
         ram: Number(ram) || 0,
         fps: Number(fps) || 0,
         region: region || "VN",
         lastSeen: now
     };
 
-    const currentPartyId = partyId || "GLOBAL";
-
-    // Đếm số lượng tab active trong phân vùng
+    // Đếm số lượng tab đang hoạt động và tạo danh sách logs
     let activeTabsCount = 0;
     let logsList = [];
     Object.values(sessionDatabase).forEach(session => {
@@ -194,6 +198,7 @@ app.post('/api/sync-power', (req, res) => {
         });
     });
 
+    // Trả về dữ liệu đã được tính toán đồng bộ tức thì
     res.json({
         success: true,
         activeTabs: activeTabsCount,

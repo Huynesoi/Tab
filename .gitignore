@@ -1,0 +1,4 @@
+node_modules/
+proxy.txt
+.env
+*.log

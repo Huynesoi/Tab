@@ -1,11 +1,13 @@
 {
-  "name": "Tab",
+  "name": "bestmoon-bot",
   "version": "1.0.0",
-  "main": "index.js",
+  "description": "Telegram automation bot for BestMoon",
+  "main": "bot.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node bot.js"
   },
-  "dependencies": {
-    "express": "^4.19.2"
+  "dependencies": {},
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
